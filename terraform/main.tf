@@ -21,7 +21,7 @@ provider "aws" {
 data "aws_caller_identity" "current" {}
 data "aws_availability_zones" "azs" {}
 
-# NETWORKING
+# ── NETWORKING ────────────────────────────────────────────────────────────────
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
@@ -87,7 +87,7 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
-# SECURITY GROUPS
+# ── SECURITY GROUPS ───────────────────────────────────────────────────────────
 resource "aws_security_group" "alb" {
   name   = "sensor-alb"
   vpc_id = aws_vpc.main.id
@@ -145,30 +145,30 @@ resource "aws_security_group" "rds" {
   }
 }
 
-# DATABASE
+# ── DATABASE ──────────────────────────────────────────────────────────────────
 resource "aws_db_subnet_group" "main" {
   name       = "sensor-db-subnets"
   subnet_ids = aws_subnet.private[*].id
 }
 
 resource "aws_db_instance" "postgres" {
-  identifier              = "sensor-db"
-  engine                  = "postgres"
-  engine_version          = "15"
-  instance_class          = var.db_instance_class
-  db_name                 = "sensordata"
-  username                = "sensor"
-  password                = var.db_password
-  storage_encrypted       = true
-  allocated_storage       = 20
-  db_subnet_group_name    = aws_db_subnet_group.main.name
-  vpc_security_group_ids  = [aws_security_group.rds.id]
-  skip_final_snapshot     = true
-  publicly_accessible     = false
-  deletion_protection     = false
+  identifier             = "sensor-db"
+  engine                 = "postgres"
+  engine_version         = "15"
+  instance_class         = var.db_instance_class
+  db_name                = "sensordata"
+  username               = "sensor"
+  password               = var.db_password
+  storage_encrypted      = true
+  allocated_storage      = 20
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  skip_final_snapshot    = true
+  publicly_accessible    = false
+  deletion_protection    = false
 }
 
-# ECR
+# ── ECR ───────────────────────────────────────────────────────────────────────
 resource "aws_ecr_repository" "api" {
   name = "sensor/api"
 }
@@ -181,34 +181,43 @@ resource "aws_ecr_repository" "frontend" {
   name = "sensor/frontend"
 }
 
-# ECS CLUSTER
+# ── ECS CLUSTER ───────────────────────────────────────────────────────────────
 resource "aws_ecs_cluster" "main" {
   name = "sensor-cluster"
 }
 
-# IAM ROLES
+# ── GITHUB OIDC PROVIDER ──────────────────────────────────────────────────────
+# Required so AWS can validate GitHub's OIDC tokens for AssumeRoleWithWebIdentity
+resource "aws_iam_openid_connect_provider" "github" {
+  url = "https://token.actions.githubusercontent.com"
+
+  client_id_list = ["sts.amazonaws.com"]
+
+  # GitHub's OIDC thumbprint (stable, verified by GitHub docs)
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+}
+
+# ── IAM ROLES ─────────────────────────────────────────────────────────────────
 resource "aws_iam_role" "github_actions_deploy" {
   name = "github-actions-deploy"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Principal = {
-          Federated = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = aws_iam_openid_connect_provider.github.arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
-        Action = "sts:AssumeRoleWithWebIdentity"
-        Condition = {
-          StringEquals = {
-            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          }
-          StringLike = {
-            "token.actions.githubusercontent.com:sub" = "repo:Ramakrishna21531/Research_Assignment:*"
-          }
+        StringLike = {
+          "token.actions.githubusercontent.com:sub" = "repo:Ramakrishna21531/Research_Assignment:*"
         }
       }
-    ]
+    }]
   })
 }
 
@@ -218,9 +227,9 @@ resource "aws_iam_role" "ecs_exec" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Service = "ecs-tasks.amazonaws.com" }
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -236,9 +245,9 @@ resource "aws_iam_role" "api_task_role" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Service = "ecs-tasks.amazonaws.com" }
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -249,9 +258,9 @@ resource "aws_iam_role" "frontend_task_role" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Service = "ecs-tasks.amazonaws.com" }
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -262,13 +271,14 @@ resource "aws_iam_role" "processor_task_role" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Service = "ecs-tasks.amazonaws.com" }
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
 
+# GitHub deploy role policy — ECS + ECR push permissions
 resource "aws_iam_role_policy" "github_actions_deploy" {
   name = "github-actions-deploy-policy"
   role = aws_iam_role.github_actions_deploy.id
@@ -276,6 +286,30 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      # ECR login — must be Resource "*"
+      {
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
+        Resource = "*"
+      },
+      # ECR push to our three repos
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload",
+          "ecr:PutImage"
+        ]
+        Resource = [
+          aws_ecr_repository.api.arn,
+          aws_ecr_repository.processor.arn,
+          aws_ecr_repository.frontend.arn
+        ]
+      },
+      # ECS deploy + run processor task
       {
         Effect = "Allow"
         Action = [
@@ -289,6 +323,7 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
         ]
         Resource = "*"
       },
+      # Allow GitHub Actions to pass task/exec roles to ECS
       {
         Effect = "Allow"
         Action = "iam:PassRole"
@@ -303,7 +338,7 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
   })
 }
 
-# LOG GROUPS
+# ── CLOUDWATCH LOG GROUPS ─────────────────────────────────────────────────────
 resource "aws_cloudwatch_log_group" "api" {
   name              = "/ecs/sensor-api"
   retention_in_days = 14
@@ -323,7 +358,7 @@ locals {
   db_url = "postgresql://sensor:${var.db_password}@${aws_db_instance.postgres.address}:5432/sensordata"
 }
 
-# TASK DEFINITIONS
+# ── TASK DEFINITIONS ──────────────────────────────────────────────────────────
 resource "aws_ecs_task_definition" "api" {
   family                   = "sensor-api"
   requires_compatibilities = ["FARGATE"]
@@ -413,8 +448,8 @@ resource "aws_ecs_task_definition" "processor" {
     essential = true
 
     environment = [
-      { name = "DATABASE_URL", value = local.db_url },
-      { name = "NUM_OBSERVATIONS", value = "10000" }
+      { name = "DATABASE_URL",      value = local.db_url },
+      { name = "NUM_OBSERVATIONS",  value = "10000" }
     ]
 
     logConfiguration = {
@@ -428,7 +463,7 @@ resource "aws_ecs_task_definition" "processor" {
   }])
 }
 
-# LOAD BALANCER
+# ── LOAD BALANCER ─────────────────────────────────────────────────────────────
 resource "aws_lb" "main" {
   name               = "sensor-alb"
   load_balancer_type = "application"
@@ -461,7 +496,7 @@ resource "aws_lb_target_group" "frontend" {
   vpc_id      = aws_vpc.main.id
 
   health_check {
-    path                = "/"
+    path                = "/health"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     interval            = 30
@@ -475,12 +510,14 @@ resource "aws_lb_listener" "http" {
   port              = 80
   protocol          = "HTTP"
 
+  # Default: everything goes to the frontend
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.frontend.arn
   }
 }
 
+# Priority 10: /api/* and /api go to the API target group
 resource "aws_lb_listener_rule" "api" {
   listener_arn = aws_lb_listener.http.arn
   priority     = 10
@@ -492,12 +529,12 @@ resource "aws_lb_listener_rule" "api" {
 
   condition {
     path_pattern {
-      values = ["/api/*", "/health"]
+      values = ["/api", "/api/*", "/health"]
     }
   }
 }
 
-# ECS SERVICES
+# ── ECS SERVICES ──────────────────────────────────────────────────────────────
 resource "aws_ecs_service" "api" {
   name             = "sensor-api"
   cluster          = aws_ecs_cluster.main.id
