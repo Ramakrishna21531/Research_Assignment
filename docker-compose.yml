@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: sensor
+      POSTGRES_USER: sensor
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-localpass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sensor"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql://sensor:${DB_PASSWORD:-localpass}@db:5432/sensor
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  processor:
+    build:
+      context: .  # project root 
+      dockerfile: processor/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://sensor:${DB_PASSWORD:-localpass}@db:5432/sensor
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - api
+      - frontend
+
+volumes:
+  pgdata:

@@ -1,0 +1,102 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: test processor
+        # run from repo root so anomaly_detector.py is on the path
+        run: |
+          pip install pandas numpy psycopg2-binary pytest -q
+          pytest processor/tests.py -v
+
+      - name: test api
+        run: |
+          pip install fastapi databases asyncpg pytest httpx -q
+          pytest api/tests.py -v
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC auth with AWS
+      contents: read    # required to checkout the code
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: build and push api
+        run: |
+          docker build -t ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }} ./api
+          docker push ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }}
+          docker tag ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }} \
+                     ${{ steps.ecr.outputs.registry }}/sensor/api:latest
+          docker push ${{ steps.ecr.outputs.registry }}/sensor/api:latest
+
+      - name: build and push processor
+        # build context must be repo root so Dockerfile can access anomaly_detector.py
+        run: |
+          docker build \
+            -f processor/Dockerfile \
+            -t ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }} \
+            .
+          docker push ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }}
+          docker tag ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }} \
+                     ${{ steps.ecr.outputs.registry }}/sensor/processor:latest
+          docker push ${{ steps.ecr.outputs.registry }}/sensor/processor:latest
+
+      - name: build and push frontend
+        run: |
+          docker build -t ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }} ./frontend
+          docker push ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }}
+          docker tag ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }} \
+                     ${{ steps.ecr.outputs.registry }}/sensor/frontend:latest
+          docker push ${{ steps.ecr.outputs.registry }}/sensor/frontend:latest
+
+      - name: deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster sensor-cluster \
+            --service sensor-api \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+          aws ecs update-service \
+            --cluster sensor-cluster \
+            --service sensor-frontend \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+          echo "Waiting for services to stabilize..."
+          aws ecs wait services-stable \
+            --cluster sensor-cluster \
+            --services sensor-api sensor-frontend \
+            --region ${{ env.AWS_REGION }}
+
+          echo "Done! App is live."

@@ -1,0 +1,12 @@
+.env
+data/*.csv
+data/processed/
+__pycache__/
+*.pyc
+.DS_Store
+terraform/*.tfvars
+!terraform/*.tfvars.example
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.backup

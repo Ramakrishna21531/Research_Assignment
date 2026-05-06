@@ -1,0 +1,4 @@
+# Reference copy to terraform.tfvars and fill in but we should not never commit terraform.tfvars
+region            = "us-east-1"
+db_password       = "Updated_Password"
+db_instance_class = "db.t3.micro"
