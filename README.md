@@ -65,6 +65,27 @@ we can output of app URL and ECR repo URLs.
 | `AWS_ROLE_ARN` | IAM role ARN that GitHub Actions can assume |
 * Make sure you to check whether you have or created a OIDC provider.
 * The role needs permissions to push ECR images and update ECS services. It uses OIDC — GitHub proves its identity to AWS and gets a short-lived token instead of storing a long-lived access key. Safer, no key rotation needed.
+* IAM ROLE Trust Policy:
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::YOUR_ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:YOUR_GITHUB_USERNAME/YOUR_REPO_NAME:*"
+        }
+      }
+    }
+  ]
+}
 
 **3. Push to main — it deploys automatically**
 
