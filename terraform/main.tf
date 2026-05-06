@@ -192,7 +192,7 @@ resource "aws_ecs_cluster" "main" {
 # IAM role that lets ECS pull images and write logs
 resource "aws_iam_role" "ecs_exec" {
   name = "sensor-ecs-exec"
-
+  
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -201,11 +201,27 @@ resource "aws_iam_role" "ecs_exec" {
       Action    = "sts:AssumeRole"
     }]
   })
+  
+}
+
+resource "aws_iam_role_policy_attachment" "ecr_full" {
+  role       = aws_iam_role.ecs_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess"
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_full" {
+  role       = aws_iam_role.ecs_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonECS_FullAccess"
 }
 
 resource "aws_iam_role_policy_attachment" "ecs_exec" {
   role       = aws_iam_role.ecs_exec.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "s3_full" {
+  role       = aws_iam_role.ecs_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
 }
 
 # log groups so we can see container output in CloudWatch
