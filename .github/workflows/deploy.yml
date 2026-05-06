@@ -35,6 +35,16 @@ jobs:
       id-token: write
       contents: read
 
+    env:
+      AWS_REGION: us-east-1
+      ECS_CLUSTER: sensor-cluster
+      API_SERVICE: sensor-api
+      FRONTEND_SERVICE: sensor-frontend
+      PROCESSOR_TASK_DEF: sensor-processor
+      ECR_API_REPO: sensor/api
+      ECR_FRONTEND_REPO: sensor/frontend
+      ECR_PROCESSOR_REPO: sensor/processor
+
     steps:
       - uses: actions/checkout@v4
 
@@ -42,127 +52,248 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ── BUILD & PUSH API ─────────────────────────────────────
       - name: build and push api
         run: |
           docker build \
-            -t ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }} \
+            -t ${{ steps.ecr.outputs.registry }}/${{ env.ECR_API_REPO }}:${{ github.sha }} \
             ./api
-          docker push ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }}
-          docker tag \
-            ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }} \
-            ${{ steps.ecr.outputs.registry }}/sensor/api:latest
-          docker push ${{ steps.ecr.outputs.registry }}/sensor/api:latest
 
-      # ── BUILD & PUSH PROCESSOR ───────────────────────────────
-      # build context is repo root so Dockerfile can access
-      # both anomaly_detector.py and generate_data.py
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_API_REPO }}:${{ github.sha }}
+
+          docker tag \
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_API_REPO }}:${{ github.sha }} \
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_API_REPO }}:latest
+
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_API_REPO }}:latest
+
       - name: build and push processor
         run: |
           docker build \
             -f processor/Dockerfile \
-            -t ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }} \
+            -t ${{ steps.ecr.outputs.registry }}/${{ env.ECR_PROCESSOR_REPO }}:${{ github.sha }} \
             .
-          docker push ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }}
-          docker tag \
-            ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }} \
-            ${{ steps.ecr.outputs.registry }}/sensor/processor:latest
-          docker push ${{ steps.ecr.outputs.registry }}/sensor/processor:latest
 
-      # ── BUILD & PUSH FRONTEND ────────────────────────────────
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_PROCESSOR_REPO }}:${{ github.sha }}
+
+          docker tag \
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_PROCESSOR_REPO }}:${{ github.sha }} \
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_PROCESSOR_REPO }}:latest
+
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_PROCESSOR_REPO }}:latest
+
       - name: build and push frontend
         run: |
           docker build \
-            -t ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }} \
+            -t ${{ steps.ecr.outputs.registry }}/${{ env.ECR_FRONTEND_REPO }}:${{ github.sha }} \
             ./frontend
-          docker push ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }}
-          docker tag \
-            ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }} \
-            ${{ steps.ecr.outputs.registry }}/sensor/frontend:latest
-          docker push ${{ steps.ecr.outputs.registry }}/sensor/frontend:latest
 
-      # ── DEPLOY API & FRONTEND TO ECS ─────────────────────────
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_FRONTEND_REPO }}:${{ github.sha }}
+
+          docker tag \
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_FRONTEND_REPO }}:${{ github.sha }} \
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_FRONTEND_REPO }}:latest
+
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_FRONTEND_REPO }}:latest
+
       - name: deploy api to ECS
         run: |
           aws ecs update-service \
-            --cluster sensor-cluster \
-            --service sensor-api \
+            --cluster "$ECS_CLUSTER" \
+            --service "$API_SERVICE" \
             --force-new-deployment \
-            --region us-east-1
+            --region "$AWS_REGION"
 
       - name: deploy frontend to ECS
         run: |
           aws ecs update-service \
-            --cluster sensor-cluster \
-            --service sensor-frontend \
+            --cluster "$ECS_CLUSTER" \
+            --service "$FRONTEND_SERVICE" \
             --force-new-deployment \
-            --region us-east-1
+            --region "$AWS_REGION"
 
-      # ── WAIT FOR SERVICES ────────────────────────────────────
+      - name: show ECS status before waiting
+        run: |
+          echo "=== API service status ==="
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$API_SERVICE" \
+            --region "$AWS_REGION" \
+            --query 'services[0].{status:status,desired:desiredCount,running:runningCount,pending:pendingCount,deployments:deployments[*].{status:status,rolloutState:rolloutState,running:runningCount,pending:pendingCount,taskDef:taskDefinition},events:events[0:10].[createdAt,message]}' \
+            --output json
+
+          echo "=== Frontend service status ==="
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$FRONTEND_SERVICE" \
+            --region "$AWS_REGION" \
+            --query 'services[0].{status:status,desired:desiredCount,running:runningCount,pending:pendingCount,deployments:deployments[*].{status:status,rolloutState:rolloutState,running:runningCount,pending:pendingCount,taskDef:taskDefinition},events:events[0:10].[createdAt,message]}' \
+            --output json
+
       - name: wait for services to stabilize
+        shell: bash
         run: |
-          aws ecs wait services-stable \
-            --cluster sensor-cluster \
-            --services sensor-api sensor-frontend \
-            --region us-east-1 \
-            --cli-read-timeout 600 \
-            --cli-connect-timeout 600
+          set -euo pipefail
 
-      # ── RUN PROCESSOR ────────────────────────────────────────
-      # Runs as a one-off ECS task — not a service.
-      # Generates 10k sensor readings inside the container,
-      # detects anomalies, saves everything to RDS, then exits.
-      # No S3 or external files needed.
+          wait_for_service() {
+            local service="$1"
+            local max_attempts=80
+            local sleep_seconds=15
+
+            echo "Waiting for service: $service"
+
+            for ((i=1; i<=max_attempts; i++)); do
+              desired=$(aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$service" \
+                --region "$AWS_REGION" \
+                --query 'services[0].desiredCount' \
+                --output text)
+
+              running=$(aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$service" \
+                --region "$AWS_REGION" \
+                --query 'services[0].runningCount' \
+                --output text)
+
+              pending=$(aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$service" \
+                --region "$AWS_REGION" \
+                --query 'services[0].pendingCount' \
+                --output text)
+
+              deployments=$(aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$service" \
+                --region "$AWS_REGION" \
+                --query 'length(services[0].deployments)' \
+                --output text)
+
+              rollout_state=$(aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$service" \
+                --region "$AWS_REGION" \
+                --query 'services[0].deployments[?status==`PRIMARY`].rolloutState | [0]' \
+                --output text)
+
+              echo "Attempt $i/$max_attempts :: service=$service desired=$desired running=$running pending=$pending deployments=$deployments rollout=$rollout_state"
+
+              if [ "$deployments" = "1" ] && [ "$running" = "$desired" ] && [ "$pending" = "0" ] && [ "$rollout_state" = "COMPLETED" ]; then
+                echo "Service $service is stable"
+                return 0
+              fi
+
+              sleep "$sleep_seconds"
+            done
+
+            echo "Service $service failed to stabilize in time"
+            echo "Recent ECS events for $service:"
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$service" \
+              --region "$AWS_REGION" \
+              --query 'services[0].events[0:20].[createdAt,message]' \
+              --output table
+
+            return 1
+          }
+
+          wait_for_service "$API_SERVICE"
+          wait_for_service "$FRONTEND_SERVICE"
+
+      - name: dump ECS events on failure
+        if: ${{ failure() }}
+        run: |
+          echo "=== API failure details ==="
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$API_SERVICE" \
+            --region "$AWS_REGION" \
+            --query 'services[0].events[0:20].[createdAt,message]' \
+            --output table
+
+          echo "=== Frontend failure details ==="
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$FRONTEND_SERVICE" \
+            --region "$AWS_REGION" \
+            --query 'services[0].events[0:20].[createdAt,message]' \
+            --output table
+
+      - name: get network config for processor
+        id: network
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUBNETS=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$API_SERVICE" \
+            --region "$AWS_REGION" \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration.subnets' \
+            --output text | tr '\t' ',')
+
+          SGS=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$API_SERVICE" \
+            --region "$AWS_REGION" \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration.securityGroups' \
+            --output text | tr '\t' ',')
+
+          echo "subnets=$SUBNETS" >> "$GITHUB_OUTPUT"
+          echo "security_groups=$SGS" >> "$GITHUB_OUTPUT"
+
       - name: run processor
+        shell: bash
         run: |
-          SUBNET=$(aws ecs describe-services \
-            --cluster sensor-cluster \
-            --services sensor-api \
-            --query "services[0].networkConfiguration.awsvpcConfiguration.subnets[0]" \
-            --output text \
-            --region us-east-1)
-
-          SG=$(aws ecs describe-services \
-            --cluster sensor-cluster \
-            --services sensor-api \
-            --query "services[0].networkConfiguration.awsvpcConfiguration.securityGroups[0]" \
-            --output text \
-            --region us-east-1)
+          set -euo pipefail
 
           TASK_ARN=$(aws ecs run-task \
-            --cluster sensor-cluster \
-            --task-definition sensor-processor \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition "$PROCESSOR_TASK_DEF" \
             --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],securityGroups=[$SG],assignPublicIp=DISABLED}" \
-            --query "tasks[0].taskArn" \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.network.outputs.subnets }}],securityGroups=[${{ steps.network.outputs.security_groups }}],assignPublicIp=DISABLED}" \
+            --query 'tasks[0].taskArn' \
             --output text \
-            --region us-east-1)
+            --region "$AWS_REGION")
+
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "Failed to start processor task"
+            exit 1
+          fi
 
           echo "Processor task started: $TASK_ARN"
 
           aws ecs wait tasks-stopped \
-            --cluster sensor-cluster \
-            --tasks $TASK_ARN \
-            --region us-east-1
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --region "$AWS_REGION"
 
           EXIT_CODE=$(aws ecs describe-tasks \
-            --cluster sensor-cluster \
-            --tasks $TASK_ARN \
-            --query "tasks[0].containers[0].exitCode" \
-            --output text \
-            --region us-east-1)
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --region "$AWS_REGION" \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
 
           echo "Processor exit code: $EXIT_CODE"
 
           if [ "$EXIT_CODE" != "0" ]; then
-            echo "Processor failed — check CloudWatch: /ecs/sensor-processor"
+            echo "Processor failed — check CloudWatch logs for task definition: $PROCESSOR_TASK_DEF"
+            aws ecs describe-tasks \
+              --cluster "$ECS_CLUSTER" \
+              --tasks "$TASK_ARN" \
+              --region "$AWS_REGION" \
+              --query 'tasks[0].containers[*].{name:name,lastStatus:lastStatus,reason:reason,exitCode:exitCode}' \
+              --output table
             exit 1
           fi
 
-          echo "Processor completed — data is in RDS, dashboard is live"
+          echo "Processor completed successfully"
