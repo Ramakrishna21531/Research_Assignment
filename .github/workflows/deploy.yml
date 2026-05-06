@@ -17,7 +17,6 @@ jobs:
           python-version: "3.11"
 
       - name: test processor
-        # run from repo root so anomaly_detector.py is on the path
         run: |
           pip install pandas numpy psycopg2-binary pytest -q
           pytest processor/tests.py -v
@@ -33,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      id-token: write  # required for OIDC auth with AWS
+      id-token: write
       contents: read
 
     steps:
@@ -56,22 +55,21 @@ jobs:
             -t ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }} \
             ./api
           docker push ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }}
-
           docker tag \
             ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }} \
             ${{ steps.ecr.outputs.registry }}/sensor/api:latest
           docker push ${{ steps.ecr.outputs.registry }}/sensor/api:latest
 
       # ── BUILD & PUSH PROCESSOR ───────────────────────────────
+      # build context is repo root so Dockerfile can access
+      # both anomaly_detector.py and generate_data.py
       - name: build and push processor
         run: |
-          # build context is repo root so Dockerfile can access anomaly_detector.py
           docker build \
             -f processor/Dockerfile \
             -t ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }} \
             .
           docker push ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }}
-
           docker tag \
             ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }} \
             ${{ steps.ecr.outputs.registry }}/sensor/processor:latest
@@ -84,13 +82,12 @@ jobs:
             -t ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }} \
             ./frontend
           docker push ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }}
-
           docker tag \
             ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }} \
             ${{ steps.ecr.outputs.registry }}/sensor/frontend:latest
           docker push ${{ steps.ecr.outputs.registry }}/sensor/frontend:latest
 
-      # ── DEPLOY API TO ECS ────────────────────────────────────
+      # ── DEPLOY API & FRONTEND TO ECS ─────────────────────────
       - name: deploy api to ECS
         run: |
           aws ecs update-service \
@@ -99,7 +96,6 @@ jobs:
             --force-new-deployment \
             --region us-east-1
 
-      # ── DEPLOY FRONTEND TO ECS ───────────────────────────────
       - name: deploy frontend to ECS
         run: |
           aws ecs update-service \
@@ -118,28 +114,11 @@ jobs:
             --cli-read-timeout 600 \
             --cli-connect-timeout 600
 
-      # ── GENERATE DATA AND UPLOAD TO S3 ───────────────────────
-      - name: generate sample data and upload to S3
-        run: |
-          pip install numpy pandas -q
-
-          python generate_data.py \
-            -n 10000 \
-            --seed 42 \
-            --anomaly-rate 0.03 \
-            -o sample_data.csv
-
-          echo "Generated $(wc -l < sample_data.csv) rows"
-
-          aws s3 cp sample_data.csv \
-            s3://${{ secrets.S3_BUCKET }}/input/sample_data.csv \
-            --region us-east-1
-
-          echo "Uploaded to S3"
-
-      # ── RUN PROCESSOR AS ONE-OFF ECS TASK ───────────────────
-      # Processor is not a service — it runs once, processes the
-      # CSV from S3, saves to RDS, then exits.
+      # ── RUN PROCESSOR ────────────────────────────────────────
+      # Runs as a one-off ECS task — not a service.
+      # Generates 10k sensor readings inside the container,
+      # detects anomalies, saves everything to RDS, then exits.
+      # No S3 or external files needed.
       - name: run processor
         run: |
           SUBNET=$(aws ecs describe-services \
@@ -167,13 +146,11 @@ jobs:
 
           echo "Processor task started: $TASK_ARN"
 
-          # wait for processor to finish
           aws ecs wait tasks-stopped \
             --cluster sensor-cluster \
             --tasks $TASK_ARN \
             --region us-east-1
 
-          # check it exited cleanly
           EXIT_CODE=$(aws ecs describe-tasks \
             --cluster sensor-cluster \
             --tasks $TASK_ARN \
@@ -184,23 +161,8 @@ jobs:
           echo "Processor exit code: $EXIT_CODE"
 
           if [ "$EXIT_CODE" != "0" ]; then
-            echo "Processor failed — check CloudWatch logs: /ecs/sensor-processor"
+            echo "Processor failed — check CloudWatch: /ecs/sensor-processor"
             exit 1
           fi
 
-          echo "Processor completed successfully"
-
-      # ── SUMMARY ─────────────────────────────────────────────
-      - name: summary
-        run: |
-          echo "Images pushed to ECR:"
-          echo "  sensor/api:${{ github.sha }}"
-          echo "  sensor/processor:${{ github.sha }}"
-          echo "  sensor/frontend:${{ github.sha }}"
-          echo ""
-          echo "Services live on ECS:"
-          echo "  sensor-api"
-          echo "  sensor-frontend"
-          echo ""
-          echo "Processor ran and loaded data into RDS."
-          echo "Dashboard is live and showing anomalies."
+          echo "Processor completed — data is in RDS, dashboard is live"

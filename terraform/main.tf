@@ -234,6 +234,10 @@ resource "aws_cloudwatch_log_group" "frontend" {
   name              = "/ecs/sensor-frontend"
   retention_in_days = 14
 }
+resource "aws_cloudwatch_log_group" "processor" {
+  name              = "/ecs/sensor-processor"
+  retention_in_days = 14
+}
 
 locals {
   db_url = "postgresql://sensor:${var.db_password}@${aws_db_instance.postgres.address}:5432/sensordata"
@@ -358,7 +362,39 @@ resource "aws_lb_listener_rule" "api" {
     path_pattern { values = ["/api/*", "/health"] }
   }
 }
+# ── Processor task definition ────────────
+# Not a long-running service — runs once as a one-off ECS task.
+# Generates its own data internally using generate_data.py,
+# detects anomalies, saves to RDS, then exits.
+resource "aws_ecs_task_definition" "processor" {
+  family                   = "sensor-processor"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.ecs_exec.arn
+  task_role_arn            = aws_iam_role.ecs_exec.arn
 
+  container_definitions = jsonencode([{
+    name      = "processor"
+    image     = "${aws_ecr_repository.processor.repository_url}:latest"
+    essential = true
+
+    environment = [
+      { name = "DATABASE_URL",      value = local.db_url },
+      { name = "NUM_OBSERVATIONS",  value = "10000" },
+    ]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.processor.name
+        awslogs-region        = var.region
+        awslogs-stream-prefix = "processor"
+      }
+    }
+  }])
+}
 # ECS SERVICES (actually runs the containers)
 
 resource "aws_ecs_service" "api" {

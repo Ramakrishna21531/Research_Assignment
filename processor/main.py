@@ -3,12 +3,12 @@ import glob
 import csv
 import shutil
 import logging
+import subprocess
 from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
 
-# anomaly_detector.py is copied into /app alongside main.py by the Dockerfile
 from anomaly_detector import AnomalyDetector
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -24,43 +24,25 @@ def get_db():
     return psycopg2.connect(DATABASE_URL)
 
 
-def download_from_s3(data_dir):
+def generate_data(data_dir):
     """
-    If S3_BUCKET env var is set, download all CSVs from
-    s3://bucket/input/ into data_dir before processing.
-    This is how the processor gets data when running on ECS —
-    CI/CD uploads the CSV to S3, processor downloads it here.
+    Generate sample sensor data inside the container.
+    Uses generate_data.py which is copied in by the Dockerfile.
+    No S3 or external file uploads needed.
     """
-    s3_bucket = os.environ.get("S3_BUCKET")
-    if not s3_bucket:
-        log.info("No S3_BUCKET set — looking for local CSV files only")
-        return
+    output = data_dir / "sample_data.csv"
+    observations = os.environ.get("NUM_OBSERVATIONS", "10000")
 
-    import boto3
-    s3 = boto3.client("s3")
+    log.info(f"Generating {observations} sensor readings...")
+    subprocess.run([
+        "python", "generate_data.py",
+        "-n", observations,
+        "--seed", "42",
+        "--anomaly-rate", "0.03",
+        "-o", str(output)
+    ], check=True)
 
-    log.info(f"Downloading CSVs from s3://{s3_bucket}/input/")
-
-    response = s3.list_objects_v2(Bucket=s3_bucket, Prefix="input/")
-    files = response.get("Contents", [])
-
-    if not files:
-        log.info("No files found in S3 input folder")
-        return
-
-    for obj in files:
-        key      = obj["Key"]
-        filename = Path(key).name
-
-        # skip folder entries
-        if not filename.endswith(".csv"):
-            continue
-
-        dest = data_dir / filename
-        log.info(f"Downloading s3://{s3_bucket}/{key} → {dest}")
-        s3.download_file(s3_bucket, key, str(dest))
-
-    log.info(f"Downloaded {len(files)} file(s) from S3")
+    log.info(f"Generated data saved to {output}")
 
 
 def load_csv(path):
@@ -121,19 +103,13 @@ def process_file(path, conn):
         batch = rows[i:i + BATCH_SIZE]
 
         with conn.cursor() as cur:
-            # 1. save readings, get real db ids back
             db_ids = save_readings(cur, batch)
 
-            # 2. update each row's id to the real db id
-            #    AnomalyDetector uses row["id"] as the foreign key reference
             for row, db_id in zip(batch, db_ids):
                 row["id"] = db_id
 
-            # 3. run the provided AnomalyDetector
             result = detector.process_batch(batch)
 
-            # 4. rename fields to match our db schema:
-            #    sensor_data_id -> reading_id, confidence_score -> confidence
             formatted = [
                 {
                     "reading_id":   int(a["sensor_data_id"]),
@@ -158,8 +134,8 @@ def main():
     data_dir.mkdir(exist_ok=True)
     done_dir.mkdir(exist_ok=True)
 
-    # pull CSVs from S3 if running on ECS
-    download_from_s3(data_dir)
+    # generate data inside the container — no S3 needed
+    generate_data(data_dir)
 
     csv_files = glob.glob(str(data_dir / "*.csv"))
 

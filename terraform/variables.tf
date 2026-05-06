@@ -10,9 +10,3 @@ variable "db_password" {
 variable "db_instance_class" {
   default = "db.t3.micro"
 }
-
-variable "s3_bucket_name" {
-  description = "Globally unique S3 bucket name for CSV data files"
-  # change this to something unique — S3 bucket names are global across all AWS accounts
-  default = "sensor-pipeline-data-Ramakrishna"
-}
