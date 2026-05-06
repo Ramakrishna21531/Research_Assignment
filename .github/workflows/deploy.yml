@@ -6,9 +6,6 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  AWS_REGION: us-east-1
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -34,9 +31,10 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+
     permissions:
-      id-token: write   # required for OIDC auth with AWS
-      contents: read    # required to checkout the code
+      id-token: write  # required for OIDC auth with AWS
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -45,58 +43,164 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: us-east-1
 
       - name: login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # ── BUILD & PUSH API ─────────────────────────────────────
       - name: build and push api
         run: |
-          docker build -t ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }} ./api
+          docker build \
+            -t ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }} \
+            ./api
           docker push ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }}
-          docker tag ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }} \
-                     ${{ steps.ecr.outputs.registry }}/sensor/api:latest
+
+          docker tag \
+            ${{ steps.ecr.outputs.registry }}/sensor/api:${{ github.sha }} \
+            ${{ steps.ecr.outputs.registry }}/sensor/api:latest
           docker push ${{ steps.ecr.outputs.registry }}/sensor/api:latest
 
+      # ── BUILD & PUSH PROCESSOR ───────────────────────────────
       - name: build and push processor
-        # build context must be repo root so Dockerfile can access anomaly_detector.py
         run: |
+          # build context is repo root so Dockerfile can access anomaly_detector.py
           docker build \
             -f processor/Dockerfile \
             -t ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }} \
             .
           docker push ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }}
-          docker tag ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }} \
-                     ${{ steps.ecr.outputs.registry }}/sensor/processor:latest
+
+          docker tag \
+            ${{ steps.ecr.outputs.registry }}/sensor/processor:${{ github.sha }} \
+            ${{ steps.ecr.outputs.registry }}/sensor/processor:latest
           docker push ${{ steps.ecr.outputs.registry }}/sensor/processor:latest
 
+      # ── BUILD & PUSH FRONTEND ────────────────────────────────
       - name: build and push frontend
         run: |
-          docker build -t ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }} ./frontend
+          docker build \
+            -t ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }} \
+            ./frontend
           docker push ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }}
-          docker tag ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }} \
-                     ${{ steps.ecr.outputs.registry }}/sensor/frontend:latest
+
+          docker tag \
+            ${{ steps.ecr.outputs.registry }}/sensor/frontend:${{ github.sha }} \
+            ${{ steps.ecr.outputs.registry }}/sensor/frontend:latest
           docker push ${{ steps.ecr.outputs.registry }}/sensor/frontend:latest
 
-      - name: deploy to ECS
+      # ── DEPLOY API TO ECS ────────────────────────────────────
+      - name: deploy api to ECS
         run: |
           aws ecs update-service \
             --cluster sensor-cluster \
             --service sensor-api \
             --force-new-deployment \
-            --region ${{ env.AWS_REGION }}
+            --region us-east-1
 
+      # ── DEPLOY FRONTEND TO ECS ───────────────────────────────
+      - name: deploy frontend to ECS
+        run: |
           aws ecs update-service \
             --cluster sensor-cluster \
             --service sensor-frontend \
             --force-new-deployment \
-            --region ${{ env.AWS_REGION }}
+            --region us-east-1
 
-          echo "Waiting for services to stabilize..."
+      # ── WAIT FOR SERVICES ────────────────────────────────────
+      - name: wait for services to stabilize
+        run: |
           aws ecs wait services-stable \
             --cluster sensor-cluster \
             --services sensor-api sensor-frontend \
-            --region ${{ env.AWS_REGION }}
+            --region us-east-1 \
+            --cli-read-timeout 600 \
+            --cli-connect-timeout 600
 
-          echo "Done! App is live."
+      # ── GENERATE DATA AND UPLOAD TO S3 ───────────────────────
+      - name: generate sample data and upload to S3
+        run: |
+          pip install numpy pandas -q
+
+          python generate_data.py \
+            -n 10000 \
+            --seed 42 \
+            --anomaly-rate 0.03 \
+            -o sample_data.csv
+
+          echo "Generated $(wc -l < sample_data.csv) rows"
+
+          aws s3 cp sample_data.csv \
+            s3://${{ secrets.S3_BUCKET }}/input/sample_data.csv \
+            --region us-east-1
+
+          echo "Uploaded to S3"
+
+      # ── RUN PROCESSOR AS ONE-OFF ECS TASK ───────────────────
+      # Processor is not a service — it runs once, processes the
+      # CSV from S3, saves to RDS, then exits.
+      - name: run processor
+        run: |
+          SUBNET=$(aws ecs describe-services \
+            --cluster sensor-cluster \
+            --services sensor-api \
+            --query "services[0].networkConfiguration.awsvpcConfiguration.subnets[0]" \
+            --output text \
+            --region us-east-1)
+
+          SG=$(aws ecs describe-services \
+            --cluster sensor-cluster \
+            --services sensor-api \
+            --query "services[0].networkConfiguration.awsvpcConfiguration.securityGroups[0]" \
+            --output text \
+            --region us-east-1)
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster sensor-cluster \
+            --task-definition sensor-processor \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],securityGroups=[$SG],assignPublicIp=DISABLED}" \
+            --query "tasks[0].taskArn" \
+            --output text \
+            --region us-east-1)
+
+          echo "Processor task started: $TASK_ARN"
+
+          # wait for processor to finish
+          aws ecs wait tasks-stopped \
+            --cluster sensor-cluster \
+            --tasks $TASK_ARN \
+            --region us-east-1
+
+          # check it exited cleanly
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster sensor-cluster \
+            --tasks $TASK_ARN \
+            --query "tasks[0].containers[0].exitCode" \
+            --output text \
+            --region us-east-1)
+
+          echo "Processor exit code: $EXIT_CODE"
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "Processor failed — check CloudWatch logs: /ecs/sensor-processor"
+            exit 1
+          fi
+
+          echo "Processor completed successfully"
+
+      # ── SUMMARY ─────────────────────────────────────────────
+      - name: summary
+        run: |
+          echo "Images pushed to ECR:"
+          echo "  sensor/api:${{ github.sha }}"
+          echo "  sensor/processor:${{ github.sha }}"
+          echo "  sensor/frontend:${{ github.sha }}"
+          echo ""
+          echo "Services live on ECS:"
+          echo "  sensor-api"
+          echo "  sensor-frontend"
+          echo ""
+          echo "Processor ran and loaded data into RDS."
+          echo "Dashboard is live and showing anomalies."

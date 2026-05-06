@@ -8,7 +8,7 @@ from pathlib import Path
 import psycopg2
 import psycopg2.extras
 
-# anomaly_detector.py is copied into the same /app directory by the Dockerfile
+# anomaly_detector.py is copied into /app alongside main.py by the Dockerfile
 from anomaly_detector import AnomalyDetector
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -22,6 +22,45 @@ detector = AnomalyDetector(window_size=20, threshold=2.0)
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
+
+
+def download_from_s3(data_dir):
+    """
+    If S3_BUCKET env var is set, download all CSVs from
+    s3://bucket/input/ into data_dir before processing.
+    This is how the processor gets data when running on ECS —
+    CI/CD uploads the CSV to S3, processor downloads it here.
+    """
+    s3_bucket = os.environ.get("S3_BUCKET")
+    if not s3_bucket:
+        log.info("No S3_BUCKET set — looking for local CSV files only")
+        return
+
+    import boto3
+    s3 = boto3.client("s3")
+
+    log.info(f"Downloading CSVs from s3://{s3_bucket}/input/")
+
+    response = s3.list_objects_v2(Bucket=s3_bucket, Prefix="input/")
+    files = response.get("Contents", [])
+
+    if not files:
+        log.info("No files found in S3 input folder")
+        return
+
+    for obj in files:
+        key      = obj["Key"]
+        filename = Path(key).name
+
+        # skip folder entries
+        if not filename.endswith(".csv"):
+            continue
+
+        dest = data_dir / filename
+        log.info(f"Downloading s3://{s3_bucket}/{key} → {dest}")
+        s3.download_file(s3_bucket, key, str(dest))
+
+    log.info(f"Downloaded {len(files)} file(s) from S3")
 
 
 def load_csv(path):
@@ -97,9 +136,9 @@ def process_file(path, conn):
             #    sensor_data_id -> reading_id, confidence_score -> confidence
             formatted = [
                 {
-                    "reading_id":   int(a["sensor_data_id"]),    # cast numpy int to python int
+                    "reading_id":   int(a["sensor_data_id"]),
                     "anomaly_type": a["anomaly_type"],
-                    "confidence":   float(round(a["confidence_score"], 4)),  # cast numpy float
+                    "confidence":   float(round(a["confidence_score"], 4)),
                 }
                 for a in result["anomalies"]
             ]
@@ -116,12 +155,16 @@ def process_file(path, conn):
 def main():
     data_dir = Path("/app/data")
     done_dir = data_dir / "processed"
+    data_dir.mkdir(exist_ok=True)
     done_dir.mkdir(exist_ok=True)
+
+    # pull CSVs from S3 if running on ECS
+    download_from_s3(data_dir)
 
     csv_files = glob.glob(str(data_dir / "*.csv"))
 
     if not csv_files:
-        log.info("No CSV files found in /app/data — nothing to do")
+        log.info("No CSV files found — nothing to do")
         return
 
     conn = get_db()
