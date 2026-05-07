@@ -58,6 +58,63 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # ── RESET ECS SERVICES ───────────────────────────────────
+      # Drain all stacked deployments before pushing new images.
+      # This prevents 3-deployment pile-ups from rapid pushes.
+      - name: reset ECS services
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          reset_service() {
+            local service="$1"
+            local desired="$2"
+
+            echo "--- Resetting $service ---"
+
+            # Scale down to 0 to drain all tasks and clear stacked deployments
+            aws ecs update-service \
+              --cluster "$ECS_CLUSTER" \
+              --service "$service" \
+              --desired-count 0 \
+              --region "$AWS_REGION" > /dev/null
+
+            echo "Waiting for $service tasks to drain..."
+            for ((i=1; i<=20; i++)); do
+              running=$(aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$service" \
+                --region "$AWS_REGION" \
+                --query 'services[0].runningCount' \
+                --output text)
+              pending=$(aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$service" \
+                --region "$AWS_REGION" \
+                --query 'services[0].pendingCount' \
+                --output text)
+              echo "  attempt $i/20 :: running=$running pending=$pending"
+              if [ "$running" = "0" ] && [ "$pending" = "0" ]; then
+                echo "$service fully drained"
+                break
+              fi
+              sleep 10
+            done
+
+            # Restore desired count — deployment will happen after image push
+            aws ecs update-service \
+              --cluster "$ECS_CLUSTER" \
+              --service "$service" \
+              --desired-count "$desired" \
+              --region "$AWS_REGION" > /dev/null
+
+            echo "$service reset complete"
+          }
+
+          reset_service "$API_SERVICE" 2
+          reset_service "$FRONTEND_SERVICE" 1
+
+      # ── BUILD & PUSH API ──────────────────────────────────────
       - name: build and push api
         run: |
           docker build \
@@ -72,6 +129,7 @@ jobs:
 
           docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_API_REPO }}:latest
 
+      # ── BUILD & PUSH PROCESSOR ────────────────────────────────
       - name: build and push processor
         run: |
           docker build \
@@ -87,6 +145,7 @@ jobs:
 
           docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_PROCESSOR_REPO }}:latest
 
+      # ── BUILD & PUSH FRONTEND ─────────────────────────────────
       - name: build and push frontend
         run: |
           docker build \
@@ -101,12 +160,14 @@ jobs:
 
           docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_FRONTEND_REPO }}:latest
 
+      # ── DEPLOY API & FRONTEND TO ECS ──────────────────────────
       - name: deploy api to ECS
         run: |
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$API_SERVICE" \
             --force-new-deployment \
+            --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100" \
             --region "$AWS_REGION"
 
       - name: deploy frontend to ECS
@@ -115,8 +176,10 @@ jobs:
             --cluster "$ECS_CLUSTER" \
             --service "$FRONTEND_SERVICE" \
             --force-new-deployment \
+            --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100" \
             --region "$AWS_REGION"
 
+      # ── SHOW STATUS BEFORE WAITING ────────────────────────────
       - name: show ECS status before waiting
         run: |
           echo "=== API service status ==="
@@ -124,7 +187,7 @@ jobs:
             --cluster "$ECS_CLUSTER" \
             --services "$API_SERVICE" \
             --region "$AWS_REGION" \
-            --query 'services[0].{status:status,desired:desiredCount,running:runningCount,pending:pendingCount,deployments:deployments[*].{status:status,rolloutState:rolloutState,running:runningCount,pending:pendingCount,taskDef:taskDefinition},events:events[0:10].[createdAt,message]}' \
+            --query 'services[0].{status:status,desired:desiredCount,running:runningCount,pending:pendingCount,deployments:deployments[*].{status:status,rolloutState:rolloutState,running:runningCount,pending:pendingCount,taskDef:taskDefinition},events:events[0:5].[createdAt,message]}' \
             --output json
 
           echo "=== Frontend service status ==="
@@ -132,9 +195,10 @@ jobs:
             --cluster "$ECS_CLUSTER" \
             --services "$FRONTEND_SERVICE" \
             --region "$AWS_REGION" \
-            --query 'services[0].{status:status,desired:desiredCount,running:runningCount,pending:pendingCount,deployments:deployments[*].{status:status,rolloutState:rolloutState,running:runningCount,pending:pendingCount,taskDef:taskDefinition},events:events[0:10].[createdAt,message]}' \
+            --query 'services[0].{status:status,desired:desiredCount,running:runningCount,pending:pendingCount,deployments:deployments[*].{status:status,rolloutState:rolloutState,running:runningCount,pending:pendingCount,taskDef:taskDefinition},events:events[0:5].[createdAt,message]}' \
             --output json
 
+      # ── WAIT FOR SERVICES ─────────────────────────────────────
       - name: wait for services to stabilize
         shell: bash
         run: |
@@ -208,6 +272,7 @@ jobs:
           wait_for_service "$API_SERVICE"
           wait_for_service "$FRONTEND_SERVICE"
 
+      # ── DUMP EVENTS ON FAILURE ────────────────────────────────
       - name: dump ECS events on failure
         if: ${{ failure() }}
         run: |
@@ -227,6 +292,7 @@ jobs:
             --query 'services[0].events[0:20].[createdAt,message]' \
             --output table
 
+      # ── GET NETWORK CONFIG FOR PROCESSOR ─────────────────────
       - name: get network config for processor
         id: network
         shell: bash
@@ -250,6 +316,7 @@ jobs:
           echo "subnets=$SUBNETS" >> "$GITHUB_OUTPUT"
           echo "security_groups=$SGS" >> "$GITHUB_OUTPUT"
 
+      # ── RUN PROCESSOR ─────────────────────────────────────────
       - name: run processor
         shell: bash
         run: |
@@ -286,7 +353,7 @@ jobs:
           echo "Processor exit code: $EXIT_CODE"
 
           if [ "$EXIT_CODE" != "0" ]; then
-            echo "Processor failed — check CloudWatch logs for task definition: $PROCESSOR_TASK_DEF"
+            echo "Processor failed — check CloudWatch logs: /ecs/sensor-processor"
             aws ecs describe-tasks \
               --cluster "$ECS_CLUSTER" \
               --tasks "$TASK_ARN" \
@@ -296,4 +363,4 @@ jobs:
             exit 1
           fi
 
-          echo "Processor completed successfully"
+          echo "Processor completed successfully — data is in RDS, dashboard is live"
